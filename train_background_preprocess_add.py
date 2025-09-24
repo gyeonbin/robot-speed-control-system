@@ -1,10 +1,12 @@
 # train_speed_conv3d_balanced.py
 # -------------------------------------------------------------
-# - 라벨: 파일명에 fast → 1, slow → 0 (오탐 방지)
-# - 입력: RGB(3) + Gray-Δt(1) = 4채널, T=WINDOW, stride=TEMP_STRIDE
+# - 라벨: 파일명에 fast → 1, slow → 0 (breakfast 오탐 방지)
+# - 입력: RGB(3) + Gray-Δt(1) = 4채널, 고정길이 윈도우 (≈ 3초)
+# - 폴더: clips/*.mp4 (예: fast_1.mp4, slow_2.mp4 ...)
 # - 분할: 영상 단위 stratified split (fast/slow 비율 유지)
-# - 불균형: WeightedRandomSampler + BCEWithLogitsLoss(pos_weight)
-# - 기타: AdamW, GradClip, 혼동행렬, sanity prints
+# - 불균형: BCEWithLogitsLoss(pos_weight)만 사용 (샘플러 제거)
+# - 안정화: SAMPLE_STRIDE로 시작 인덱스 간격, GradClip, AMP
+# - 기타: 혼동행렬 프린트, sanity prints, 메타 저장
 # -------------------------------------------------------------
 
 import os, re, json, glob, random
@@ -14,15 +16,21 @@ import cv2
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torch.utils.data import Dataset, DataLoader
 
 # ------------------ 설정 ------------------
-WINDOW = 16            # 시계열 길이
-TEMP_STRIDE = 2        # 프레임 간격 (2 → 약 66ms@30fps)
+# 카메라 FPS가 고정(동일 캠)이라고 했으니 30으로 두고 필요시 바꿔도 됨.
+FPS = 30
+WINDOW_SEC = 3.0       # "3초 윈도우" 요구사항
+TEMP_STRIDE = 2        # 프레임 간 간격(샘플링 스텝). 2면 15Hz 샘플링 느낌.
+# WINDOW는 WINDOW_SEC, FPS, TEMP_STRIDE로 자동계산
+WINDOW = max(2, int(round(WINDOW_SEC * FPS / TEMP_STRIDE)))  # ≈ 45 (3s @30fps, stride=2)
+
+SAMPLE_STRIDE = 8      # 윈도우 시작 인덱스 간격(과적합/중복 완화)
 IMG_SIZE = 112
-BATCH_SIZE = 8
-LR = 5e-4
-EPOCHS = 25
+BATCH_SIZE = 32
+LR = 2e-3
+EPOCHS = 10
 NUM_WORKERS = 0        # Windows면 0 권장
 WEIGHT_DECAY = 1e-4
 SEED = 42
@@ -30,8 +38,10 @@ SEED = 42
 # 채널 정규화
 MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+# Δt(차영상) 정규화 스케일 (간단히 0.0/0.5로 시작 → 데이터에 맞춰 조정 가능)
+DIF_MEAN, DIF_STD = 0.0, 0.5
 
-# 라벨 파싱(단어 경계) - breakfast 오탐 방지
+# 라벨 파싱(단어 경계) - 'breakfast' 오탐 방지
 FAST_RE = re.compile(r'(^|[^a-z])fast([^a-z]|$)')
 SLOW_RE = re.compile(r'(^|[^a-z])slow([^a-z]|$)')
 
@@ -61,20 +71,28 @@ def preprocess_gray(frame_rgb: np.ndarray) -> np.ndarray:
     gray = cv2.resize(gray, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_AREA)
     return (gray.astype(np.float32) / 255.0)  # (H,W)
 
+def preprocess_diff(diff: np.ndarray) -> np.ndarray:
+    # diff: 0..1 -> 간단 정규화
+    return (diff - DIF_MEAN) / max(1e-6, DIF_STD)
+
 # ------------------ Dataset ------------------
 class OnTheFlyVideoDataset(Dataset):
     """
     - 디스크에서 바로 읽음(프레임 캐시 X)
     - 입력: (4,T,H,W) = RGB(3) + Gray-Δt(1)
+    - WINDOW ≈ WINDOW_SEC(초) 길이가 되도록 TEMP_STRIDE로 등간격 샘플
     """
-    def __init__(self, video_files: List[str], window: int = WINDOW, stride: int = TEMP_STRIDE):
+    def __init__(self, video_files: List[str], window: int = WINDOW,
+                 stride: int = TEMP_STRIDE, sample_stride: int = SAMPLE_STRIDE):
         self.window = window
         self.stride = stride
+        self.sample_stride = sample_stride
         self.samples: List[Tuple[str, int, int]] = []  # (video_path, start_idx, label)
 
+        need = (window - 1) * stride + 1  # 필요한 원본 프레임 수
         for vp in video_files:
             lb = label_from_name(vp)
-            if lb not in (0,1):
+            if lb not in (0, 1):
                 continue
 
             cap = cv2.VideoCapture(vp)
@@ -83,9 +101,9 @@ class OnTheFlyVideoDataset(Dataset):
             total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             cap.release()
 
-            need = (window - 1) * stride + 1
             if total >= need:
-                for s in range(0, total - need + 1):
+                # 시작 인덱스 간격을 sample_stride로 띄워서 중복·상관을 낮춤
+                for s in range(0, total - need + 1, self.sample_stride):
                     self.samples.append((vp, s, lb))
 
     def __len__(self):
@@ -104,21 +122,23 @@ class OnTheFlyVideoDataset(Dataset):
             cap.set(cv2.CAP_PROP_POS_FRAMES, target_f)
             ok, frame = cap.read()
 
-            if not ok:
-                proc_rgb = clip_rgb[-1] if clip_rgb else np.zeros((3, IMG_SIZE, IMG_SIZE), np.float32)
-                gray = clip_dif[-1][0] if clip_dif else np.zeros((IMG_SIZE, IMG_SIZE), np.float32)
-            else:
+            if ok:
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 proc_rgb = preprocess_rgb(rgb)         # (3,H,W)
-                gray = preprocess_gray(rgb)            # (H,W)
+                gray = preprocess_gray(rgb)            # (H,W) in 0..1
+            else:
+                # fallback: 이전 프레임 재사용 (버그 수정: gray는 last_gray 사용)
+                proc_rgb = clip_rgb[-1] if clip_rgb else np.zeros((3, IMG_SIZE, IMG_SIZE), np.float32)
+                gray = last_gray if last_gray is not None else np.zeros((IMG_SIZE, IMG_SIZE), np.float32)
 
             if last_gray is None:
                 diff = np.zeros((IMG_SIZE, IMG_SIZE), np.float32)
             else:
-                diff = np.abs(gray - last_gray)
+                diff = np.abs(gray - last_gray)        # 0..1
+            diff = preprocess_diff(diff)               # 정규화
 
             clip_rgb.append(proc_rgb)
-            clip_dif.append(diff[None, ...])          # (1,H,W)
+            clip_dif.append(diff[None, ...])           # (1,H,W)
             last_gray = gray
 
         cap.release()
@@ -136,15 +156,15 @@ class Small3DCNN(nn.Module):
         self.backbone = nn.Sequential(
             nn.Conv3d(in_ch, 16, kernel_size=(3,3,3), padding=1),
             nn.ReLU(inplace=True),
-            nn.MaxPool3d(kernel_size=(1,2,2)),  # 공간만
+            nn.MaxPool3d(kernel_size=(1,2,2)),  # 공간만 다운
 
             nn.Conv3d(16, 32, kernel_size=(3,3,3), padding=1),
             nn.ReLU(inplace=True),
-            nn.MaxPool3d(kernel_size=(2,2,2)),  # 시간/공간
+            nn.MaxPool3d(kernel_size=(2,2,2)),  # 시간/공간 다운
 
             nn.Conv3d(32, 64, kernel_size=(3,3,3), padding=1),
             nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool3d((1,1,1)),
+            nn.AdaptiveAvgPool3d((1,1,1)),      # 가변 T 안정화
         )
         self.fc = nn.Linear(64, 1)
 
@@ -154,8 +174,8 @@ class Small3DCNN(nn.Module):
         logit = self.fc(z)       # (B,1)
         return logit
 
-# ------------------ 학습/평가 ------------------
-def evaluate(model, loader, device, verbose=False):
+# ------------------ 평가(정확도/혼동행렬) ------------------
+def evaluate(model, loader, device, verbose=False, thr=0.5):
     model.eval()
     total, correct = 0, 0
     tp=tn=fp=fn=0
@@ -164,7 +184,7 @@ def evaluate(model, loader, device, verbose=False):
             x = x.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True).float().squeeze(1)
             prob = torch.sigmoid(model(x)).squeeze(1)
-            pred = (prob >= 0.5).float()
+            pred = (prob >= thr).float()
             correct += (pred == y).sum().item()
             tp += ((pred==1)&(y==1)).sum().item()
             tn += ((pred==0)&(y==0)).sum().item()
@@ -175,36 +195,30 @@ def evaluate(model, loader, device, verbose=False):
         print(f"[VAL] TP:{tp} TN:{tn} FP:{fp} FN:{fn}")
     return correct / max(1, total)
 
-def make_weighted_sampler(samples: List[Tuple[str,int,int]]):
-    # 클래스별 빈도 기반 가중치 (희소 클래스 업샘플)
-    labels = [lb for _,_,lb in samples]
-    n_pos = sum(1 for lb in labels if lb==1)
-    n_neg = sum(1 for lb in labels if lb==0)
-    w_pos = 0.5 / max(1, n_pos)
-    w_neg = 0.5 / max(1, n_neg)
-    weights = [w_pos if lb==1 else w_neg for lb in labels]
-    return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True), n_pos, n_neg
-
 # ------------------ 메인 ------------------
 if __name__ == "__main__":
     set_seed(SEED)
     os.makedirs("models", exist_ok=True)
 
-    # 1) 비디오 목록 + 라벨
-    video_files = sorted(glob.glob(os.path.join("data", "*.mp4")))
+    # 1) 비디오 목록 + 라벨 (clips 폴더 사용)
+    exts = ("*.mp4", "*.avi", "*.mov", "*.mkv")
+    video_files = []
+    for ext in exts:
+        video_files.extend(glob.glob(os.path.join("clips", ext)))
+    video_files = sorted(video_files)
+
     labeled = [(vp, label_from_name(vp)) for vp in video_files]
-    labeled = [(vp, lb) for vp,lb in labeled if lb in (0,1)]
+    labeled = [(vp, lb) for vp, lb in labeled if lb in (0, 1)]
     if not labeled:
-        raise FileNotFoundError("data/*.mp4 에 fast/slow 라벨 파일이 필요합니다.")
+        raise FileNotFoundError("clips/*.mp4 등에 fast_*, slow_* 라벨 파일이 필요합니다.")
 
     # 2) stratified split (영상 단위)
-    fast = [vp for vp,lb in labeled if lb==1]
-    slow = [vp for vp,lb in labeled if lb==0]
-    # 섞기
+    fast = [vp for vp, lb in labeled if lb == 1]
+    slow = [vp for vp, lb in labeled if lb == 0]
     random.shuffle(fast); random.shuffle(slow)
 
     def split_ratio(lst, r=0.8):
-        n = max(1, int(len(lst)*r))
+        n = max(1, int(len(lst) * r))
         return lst[:n], lst[n:]
 
     tr_fast, va_fast = split_ratio(fast, 0.8)
@@ -218,24 +232,27 @@ if __name__ == "__main__":
           f"val fast/slow = {len(va_fast)}/{len(va_slow)}")
 
     # 3) Dataset/DataLoader
-    tr_ds = OnTheFlyVideoDataset(tr_files, window=WINDOW, stride=TEMP_STRIDE)
-    va_ds = OnTheFlyVideoDataset(va_files, window=WINDOW, stride=TEMP_STRIDE) if len(va_files)>0 else None
+    tr_ds = OnTheFlyVideoDataset(tr_files, window=WINDOW, stride=TEMP_STRIDE, sample_stride=SAMPLE_STRIDE)
+    va_ds = OnTheFlyVideoDataset(va_files, window=WINDOW, stride=TEMP_STRIDE, sample_stride=SAMPLE_STRIDE) if len(va_files) > 0 else None
     if len(tr_ds) == 0:
         raise RuntimeError("학습 윈도우가 0개입니다. 영상 길이 또는 WINDOW/STRIDE를 확인하세요.")
 
-    # Weighted sampler (클래스 불균형 보정)
-    sampler, n_pos, n_neg = make_weighted_sampler(tr_ds.samples)
-    tr_loader = DataLoader(tr_ds, batch_size=BATCH_SIZE, sampler=sampler,
+    tr_loader = DataLoader(tr_ds, batch_size=BATCH_SIZE, shuffle=True,
                            num_workers=NUM_WORKERS, pin_memory=False)
     va_loader = DataLoader(va_ds, batch_size=BATCH_SIZE, shuffle=False,
                            num_workers=NUM_WORKERS, pin_memory=False) if va_ds else None
 
-    print(f"[INFO] train windows: {len(tr_ds)} | val windows: {len(va_ds) if va_ds else 0}")
-    print(f"[INFO] train label counts: slow={n_neg} / fast={n_pos}")
+    print(f"[INFO] WINDOW={WINDOW} (~{WINDOW_SEC:.1f}s @FPS={FPS}, stride={TEMP_STRIDE}) | "
+          f"train windows: {len(tr_ds)} | val windows: {len(va_ds) if va_ds else 0}")
 
-    # pos_weight (BCE)
+    # pos_weight (BCE) — 샘플러 대신 이것만 사용
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp = torch.cuda.is_available()
+
+    labels = [lb for _, _, lb in tr_ds.samples]
+    n_pos = sum(1 for lb in labels if lb == 1)
+    n_neg = len(labels) - n_pos
+    print(f"[INFO] train label counts (window-level): slow={n_neg} / fast={n_pos}")
 
     pos_weight = torch.tensor([n_neg / max(1, n_pos)], device=device, dtype=torch.float32)
 
@@ -268,7 +285,7 @@ if __name__ == "__main__":
 
     # 5) 학습 루프
     best_acc = -1.0
-    for e in range(1, EPOCHS+1):
+    for e in range(1, EPOCHS + 1):
         loss = train_one_epoch()
         if va_loader:
             acc = evaluate(model, va_loader, device, verbose=(e % 5 == 0))
@@ -282,11 +299,15 @@ if __name__ == "__main__":
     # 6) 마지막 저장 + 메타
     torch.save(model.state_dict(), os.path.join("models", "speed_conv3d_last.pt"))
     meta = {
+        "fps": FPS,
+        "window_sec": WINDOW_SEC,
         "window": WINDOW,
         "temp_stride": TEMP_STRIDE,
+        "sample_stride": SAMPLE_STRIDE,
         "img_size": IMG_SIZE,
         "mean": MEAN.tolist(),
         "std": STD.tolist(),
+        "diff_norm": {"mean": DIF_MEAN, "std": DIF_STD},
         "label_def": {"slow": 0, "fast": 1},
         "in_channels": 4,
     }
