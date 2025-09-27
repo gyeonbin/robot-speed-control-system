@@ -11,7 +11,7 @@ import tkinter as tk
 from tkinter import messagebox
 
 # ===== 설정 =====
-OUTPUT_DIR = Path("version_0_0_1/clips")         # 클립 저장 폴더
+OUTPUT_DIR = Path("../clips")         # 클립 저장 폴더
 CAM_INDEX = 1                      # 웹캠 인덱스
 TARGET_FPS = 30                    # 파일 저장 FPS(웹캠 fps 불확실 대비)
 FOURCC = cv2.VideoWriter_fourcc(*'mp4v')  # .mp4

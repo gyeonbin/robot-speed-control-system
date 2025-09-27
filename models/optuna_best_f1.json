@@ -1,0 +1,14 @@
+{
+  "best_value": 0.9999999999995,
+  "best_params": {
+    "img_size": 96,
+    "batch_size": 32,
+    "lr": 0.0010502105436744284,
+    "weight_decay": 0.000133112160807369,
+    "width_mult": 1.25,
+    "n_blocks": 1,
+    "pool_t_pat": "b1",
+    "kt_mode": "3x3x1+stride_t2",
+    "dropout_p": 0.3
+  }
+}

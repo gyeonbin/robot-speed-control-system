@@ -1,0 +1,25 @@
+=== Confusion Matrix (rows=True, cols=Pred) ===
+labels: 0=slow, 1=fast
+[[100   0]
+ [  3  97]]
+
+=== Accuracy ===
+98.50%
+
+=== Classification Report ===
+              precision    recall  f1-score   support
+
+        slow     0.9709    1.0000    0.9852       100
+        fast     1.0000    0.9700    0.9848       100
+
+    accuracy                         0.9850       200
+   macro avg     0.9854    0.9850    0.9850       200
+weighted avg     0.9854    0.9850    0.9850       200
+
+
+=== Preprocess time (ms) ===
+mean=2519.33, median=2449.87, min=2285.13, max=3346.69
+=== Inference time (ms) ===
+mean=219.54, median=225.84, min=102.53, max=367.22
+
+쓰레숄더 0.49로 해서 모델 돌렸음

@@ -4,7 +4,7 @@
   "window": 15,
   "temp_stride": 2,
   "sample_stride": 8,
-  "img_size": 112,
+  "img_size": 96,
   "mean": [
     0.48500001430511475,
     0.4560000002384186,
@@ -24,10 +24,24 @@
     "fast": 1
   },
   "in_channels": 4,
-  "use_tqdm": true,
+  "time_split": {
+    "train_sec": 60,
+    "val_sec": 20,
+    "max_duration_sec": 80
+  },
+  "model": {
+    "width_mult": 1.25,
+    "n_blocks": 1,
+    "pool_t_pattern": "b1",
+    "kt_mode": "3x3x1+stride_t2",
+    "dropout_p": 0.3,
+    "act": "relu"
+  },
+  "best_val_f1": 0.9999999999995,
   "early_stopping": {
     "patience": 3,
     "min_delta": 0.0,
-    "monitor": "val_acc"
-  }
+    "monitor": "val_f1"
+  },
+  "note": "Frames resized directly to (img_size,img_size) at decode time for memory saving."
 }

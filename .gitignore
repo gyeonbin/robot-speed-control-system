@@ -1,6 +1,14 @@
-<<<<<<< HEAD
+# 데이터 디렉토리
 data/
-version_0_0_1/clips/
-=======
-/.vscode
->>>>>>> 15d59f8fc88c995ffde3ff62920862709832534d
+
+# VSCode 설정
+.vscode/
+
+# 녹화 파일
+clips/
+
+# 테스트 데이터
+test/
+
+# 학습 데이터
+train/train_data/
